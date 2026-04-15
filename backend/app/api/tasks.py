@@ -5,9 +5,9 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,6 +34,11 @@ class TaskCreate(BaseModel):
     project_path: Optional[str] = None
     repo_name: Optional[str] = None
     repo_url: Optional[str] = None
+    document_context: Optional[str] = None
+
+
+# In-memory store for uploaded document context keyed by upload_id
+_uploaded_docs: Dict[str, str] = {}
 
 
 class TaskResponse(BaseModel):
@@ -191,6 +196,9 @@ async def create_task(
 
     logger.info("Created task #%d: %s (repo: %s)", task.id, task.title, repo_name)
 
+    # Collect document context (from upload or inline)
+    document_context = task_data.document_context or ""
+
     # Start the orchestrator in the background
     import asyncio
 
@@ -204,6 +212,7 @@ async def create_task(
             repo_name=repo_name,
             branch_name=branch_name,
             websocket_callback=ws_callback,
+            document_context=document_context,
         )
     )
 
@@ -299,6 +308,63 @@ async def get_task_approvals(
         .order_by(Approval.created_at.desc())
     )
     return result.scalars().all()
+
+
+@router.post("/upload-document")
+async def upload_document(file: UploadFile = File(...)) -> dict:
+    """Upload a document to provide as context for a task.
+
+    Supports .txt, .md, .py, .js, .ts, .json, .csv, .yaml, .yml, .xml, .html, .css files.
+
+    Returns:
+        Dict with upload_id and extracted text preview.
+    """
+    allowed_extensions = {
+        ".txt", ".md", ".py", ".js", ".ts", ".jsx", ".tsx", ".json",
+        ".csv", ".yaml", ".yml", ".xml", ".html", ".css", ".sql",
+        ".sh", ".bat", ".cfg", ".ini", ".toml", ".env", ".log",
+    }
+
+    filename = file.filename or "upload.txt"
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type: {ext}. Supported: {', '.join(sorted(allowed_extensions))}",
+        )
+
+    content_bytes = await file.read()
+    if len(content_bytes) > 500_000:  # 500KB limit
+        raise HTTPException(status_code=400, detail="File too large. Max 500KB.")
+
+    try:
+        text = content_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = content_bytes.decode("latin-1")
+        except Exception:
+            raise HTTPException(status_code=400, detail="Could not decode file as text.")
+
+    import uuid
+    upload_id = str(uuid.uuid4())[:8]
+    _uploaded_docs[upload_id] = f"[Uploaded: {filename}]\n{text}"
+
+    logger.info("Uploaded document: %s (%d chars) -> %s", filename, len(text), upload_id)
+    return {
+        "upload_id": upload_id,
+        "filename": filename,
+        "size": len(text),
+        "preview": text[:200] + ("..." if len(text) > 200 else ""),
+    }
+
+
+@router.get("/upload-document/{upload_id}")
+async def get_uploaded_document(upload_id: str) -> dict:
+    """Retrieve uploaded document content by ID."""
+    content = _uploaded_docs.get(upload_id)
+    if not content:
+        raise HTTPException(status_code=404, detail="Upload not found or expired.")
+    return {"upload_id": upload_id, "content": content}
 
 
 @router.post("/{task_id}/approvals/{approval_id}/respond")

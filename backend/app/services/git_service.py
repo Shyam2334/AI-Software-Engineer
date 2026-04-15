@@ -30,16 +30,23 @@ class GitService:
         return self._github
 
     def _set_remote_auth(self, repo: Repo) -> None:
-        """Ensure the origin remote URL includes the token for auth."""
+        """Ensure the origin remote URL includes the current token for auth."""
         if not settings.github_token:
             return
         origin = repo.remotes.origin
         current_url = origin.url
-        if "github.com" in current_url and f"{settings.github_token}@" not in current_url:
-            authed_url = current_url.replace(
-                "https://", f"https://{settings.github_token}@"
-            )
-            origin.set_url(authed_url)
+        if "github.com" not in current_url:
+            return
+        # Already has the correct token
+        if f"https://{settings.github_token}@github.com" in current_url:
+            return
+        # Build the clean authed URL — strip any old token first
+        import re as _re
+        clean_url = _re.sub(r"https://[^@]+@github\.com", "https://github.com", current_url)
+        authed_url = clean_url.replace(
+            "https://github.com", f"https://{settings.github_token}@github.com"
+        )
+        origin.set_url(authed_url)
 
     def clone_repo(self, repo_url: str, local_path: str) -> Repo:
         """Clone a repository to the local filesystem.
@@ -55,7 +62,19 @@ class GitService:
             logger.info("Repository already exists at %s, pulling latest", local_path)
             repo = Repo(local_path)
             self._set_remote_auth(repo)
-            repo.remotes.origin.pull()
+            # Fetch + reset to remote HEAD to ensure clean latest state
+            default_branch = self._detect_default_branch(repo)
+            try:
+                repo.remotes.origin.fetch()
+                repo.git.checkout(default_branch)
+                repo.git.reset("--hard", f"origin/{default_branch}")
+                logger.info("Reset to latest origin/%s", default_branch)
+            except Exception as e:
+                logger.warning("Could not reset to latest: %s, trying pull", e)
+                try:
+                    repo.remotes.origin.pull()
+                except Exception as pull_err:
+                    logger.warning("Pull also failed: %s", pull_err)
             return repo
 
         logger.info("Cloning %s to %s", repo_url, local_path)
@@ -67,13 +86,31 @@ class GitService:
             )
         return Repo.clone_from(repo_url, local_path)
 
-    def create_branch(self, repo_path: str, branch_name: str, base_branch: str = "main") -> str:
+    @staticmethod
+    def _detect_default_branch(repo: Repo) -> str:
+        """Detect the default branch (main, master, etc.) from remote HEAD."""
+        try:
+            # Try reading the symbolic ref for origin/HEAD
+            ref = repo.git.symbolic_ref("refs/remotes/origin/HEAD", short=True)
+            # ref looks like "origin/main" — strip the "origin/" prefix
+            return ref.replace("origin/", "")
+        except Exception:
+            pass
+        # Fallback: check common names
+        remote_refs = [r.name for r in repo.remotes.origin.refs]
+        for candidate in ("origin/main", "origin/master", "origin/develop"):
+            if candidate in remote_refs:
+                return candidate.replace("origin/", "")
+        # Last resort
+        return "main"
+
+    def create_branch(self, repo_path: str, branch_name: str, base_branch: str = "") -> str:
         """Create and checkout a new branch.
 
         Args:
             repo_path: Path to the local repository.
             branch_name: Name for the new branch.
-            base_branch: Branch to base off of.
+            base_branch: Branch to base off of (auto-detected if empty).
 
         Returns:
             The branch name.
@@ -81,12 +118,23 @@ class GitService:
         repo = Repo(repo_path)
         self._set_remote_auth(repo)
 
-        # Ensure we're on the base branch and up to date
+        # Auto-detect default branch if not specified
+        if not base_branch:
+            base_branch = self._detect_default_branch(repo)
+            logger.info("Auto-detected default branch: %s", base_branch)
+
+        # Fetch latest, checkout base, and reset to ensure we have the latest code
+        try:
+            repo.remotes.origin.fetch()
+        except Exception as e:
+            logger.warning("Could not fetch from remote: %s", e)
+
         repo.git.checkout(base_branch)
         try:
-            repo.remotes.origin.pull()
+            repo.git.reset("--hard", f"origin/{base_branch}")
+            logger.info("Reset %s to origin/%s", base_branch, base_branch)
         except Exception as e:
-            logger.warning("Could not pull latest: %s", e)
+            logger.warning("Could not reset to origin/%s: %s", base_branch, e)
 
         # Create and checkout new branch
         if branch_name in [b.name for b in repo.branches]:
@@ -138,7 +186,16 @@ class GitService:
         """
         repo = Repo(repo_path)
         self._set_remote_auth(repo)
-        repo.remotes.origin.push(branch_name, set_upstream=True)
+        # Disable Git Credential Manager so the token in the URL is used
+        with repo.git.custom_environment(
+            GIT_TERMINAL_PROMPT="0",
+            GIT_ASKPASS="",
+            GIT_CONFIG_NOSYSTEM="1",
+        ):
+            repo.config_writer(config_level="repository").set_value(
+                "credential", "helper", ""
+            ).release()
+            repo.remotes.origin.push(branch_name, set_upstream=True)
         logger.info("Pushed branch: %s", branch_name)
 
     def create_pull_request(

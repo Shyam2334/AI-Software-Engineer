@@ -44,7 +44,7 @@ class WebBrowserService:
         return self._client
 
     async def search_web(self, query: str, max_results: int = 5) -> List[dict]:
-        """Search the web using DuckDuckGo HTML endpoint.
+        """Search the web using DuckDuckGo.
 
         Args:
             query: Search query.
@@ -55,47 +55,17 @@ class WebBrowserService:
         """
         results: List[dict] = []
         try:
-            url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
-            resp = await self.client.get(url)
-            resp.raise_for_status()
-            html = resp.text
+            from ddgs import DDGS
 
-            # Parse results from DuckDuckGo HTML
-            result_blocks = re.findall(
-                r'class="result__body">(.*?)</div>\s*</div>',
-                html,
-                re.DOTALL,
-            )
-
-            if not result_blocks:
-                # Fallback: try simpler pattern
-                result_blocks = re.findall(
-                    r'<div class="result[^"]*">(.*?)</div>\s*</div>',
-                    html,
-                    re.DOTALL,
-                )
-
-            for block in result_blocks[:max_results]:
-                title_match = re.search(
-                    r'class="result__a"[^>]*>(.*?)</a>', block, re.DOTALL
-                )
-                url_match = re.search(
-                    r'class="result__a"\s+href="([^"]+)"', block
-                )
-                snippet_match = re.search(
-                    r'class="result__snippet"[^>]*>(.*?)</(?:a|span|td)',
-                    block,
-                    re.DOTALL,
-                )
-
-                if title_match:
+            with DDGS() as ddgs:
+                for r in ddgs.text(query, max_results=max_results):
                     results.append({
-                        "title": _strip_html(title_match.group(1)),
-                        "url": url_match.group(1) if url_match else "",
-                        "snippet": _strip_html(snippet_match.group(1)) if snippet_match else "",
+                        "title": r.get("title", ""),
+                        "url": r.get("href", ""),
+                        "snippet": r.get("body", ""),
                     })
 
-            logger.info("Web search for '%s': %d results", query, len(results))
+            logger.info("Web search for '%s': %d results", query[:80], len(results))
 
         except Exception as e:
             logger.warning("Web search error: %s", e)

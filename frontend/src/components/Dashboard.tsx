@@ -20,7 +20,21 @@ import {
   User,
   Sparkles,
   Plus,
+  Paperclip,
+  X,
+  Search,
+  Lock,
+  Globe,
 } from "lucide-react";
+
+interface GitHubRepo {
+  full_name: string;
+  html_url: string;
+  description: string | null;
+  private: boolean;
+  default_branch: string;
+  updated_at: string;
+}
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -66,9 +80,16 @@ export function Dashboard({ selectedTaskId, onTaskStarted }: DashboardProps) {
   const [showGitWorkflow, setShowGitWorkflow] = useState(false);
   const [historicalLogs, setHistoricalLogs] = useState<WSMessage[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
+  const [uploadedFile, setUploadedFile] = useState<{ name: string; content: string } | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [githubRepos, setGithubRepos] = useState<GitHubRepo[]>([]);
+  const [reposLoading, setReposLoading] = useState(false);
+  const [repoSearch, setRepoSearch] = useState("");
+  const [repoDropdownOpen, setRepoDropdownOpen] = useState(false);
 
   const chatEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const {
     connected,
@@ -152,6 +173,74 @@ export function Dashboard({ selectedTaskId, onTaskStarted }: DashboardProps) {
         ? logs
         : historicalLogs;
 
+  // ── File upload handler ─────────────────────────────────────
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await fetch("/api/tasks/upload-document", {
+        method: "POST",
+        body: formData,
+      });
+      if (res.ok) {
+        const data = await res.json();
+        // Fetch the full content
+        const contentRes = await fetch(`/api/tasks/upload-document/${data.upload_id}`);
+        if (contentRes.ok) {
+          const contentData = await contentRes.json();
+          setUploadedFile({ name: data.filename, content: contentData.content });
+        }
+      } else {
+        const err = await res.json();
+        alert(err.detail || "Upload failed");
+      }
+    } catch {
+      alert("Upload failed. Check connection.");
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
+  // ── Fetch GitHub repos when repo input opens ─────────────────
+
+  const fetchGithubRepos = useCallback(async () => {
+    setReposLoading(true);
+    try {
+      const res = await fetch("/api/connectors/github/repos?per_page=100");
+      if (res.ok) {
+        setGithubRepos(await res.json());
+      }
+    } catch {
+      // GitHub not connected — dropdown will show manual input hint
+    } finally {
+      setReposLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (showRepoInput && githubRepos.length === 0) {
+      fetchGithubRepos();
+    }
+  }, [showRepoInput, fetchGithubRepos, githubRepos.length]);
+
+  const filteredRepos = githubRepos.filter(
+    (r) =>
+      r.full_name.toLowerCase().includes(repoSearch.toLowerCase()) ||
+      (r.description?.toLowerCase().includes(repoSearch.toLowerCase()) ?? false)
+  );
+
+  const selectRepo = (repo: GitHubRepo) => {
+    setRepoUrl(repo.html_url);
+    setRepoNameInput(repo.full_name);
+    setRepoDropdownOpen(false);
+    setRepoSearch("");
+  };
+
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chatMessages, logs, approvalRequest]);
@@ -190,6 +279,7 @@ export function Dashboard({ selectedTaskId, onTaskStarted }: DashboardProps) {
             description: fullDescription,
             repo_url: repoUrl.trim() || undefined,
             repo_name: repoNameInput.trim() || undefined,
+            document_context: uploadedFile?.content || undefined,
           }),
         });
 
@@ -197,6 +287,7 @@ export function Dashboard({ selectedTaskId, onTaskStarted }: DashboardProps) {
           const task = await response.json();
           setActiveTaskId(task.id);
           onTaskStarted?.(task.id);
+          setUploadedFile(null);
 
           setChatMessages((prev) => [
             ...prev,
@@ -232,6 +323,66 @@ export function Dashboard({ selectedTaskId, onTaskStarted }: DashboardProps) {
       } finally {
         setSubmitting(false);
       }
+    } else {
+      // Follow-up on active task: create a new related task
+      setSubmitting(true);
+      const fullDescription = `[${taskType.toUpperCase()}] Follow-up on task #${activeTaskId}: ${message}`;
+
+      try {
+        const response = await fetch("/api/tasks/", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: message.slice(0, 100),
+            description: fullDescription,
+            repo_url: repoUrl.trim() || undefined,
+            repo_name: repoNameInput.trim() || undefined,
+            document_context: uploadedFile?.content || undefined,
+          }),
+        });
+
+        if (response.ok) {
+          const task = await response.json();
+          clearMessages();
+          setHistoricalLogs([]);
+          setActiveTaskId(task.id);
+          onTaskStarted?.(task.id);
+          setUploadedFile(null);
+
+          setChatMessages((prev) => [
+            ...prev,
+            {
+              id: `ack-${task.id}`,
+              role: "agent",
+              content: `Starting follow-up task #${task.id}. I'll work on this right away.`,
+              timestamp: new Date(),
+              taskId: task.id,
+            },
+          ]);
+        } else {
+          setChatMessages((prev) => [
+            ...prev,
+            {
+              id: `err-${Date.now()}`,
+              role: "system",
+              content: "Failed to create follow-up task.",
+              timestamp: new Date(),
+            },
+          ]);
+        }
+      } catch {
+        setChatMessages((prev) => [
+          ...prev,
+          {
+            id: `err-${Date.now()}`,
+            role: "system",
+            content: "Connection error.",
+            timestamp: new Date(),
+          },
+        ]);
+      } finally {
+        setSubmitting(false);
+      }
     }
 
     inputRef.current?.focus();
@@ -252,6 +403,7 @@ export function Dashboard({ selectedTaskId, onTaskStarted }: DashboardProps) {
     setRepoUrl("");
     setRepoNameInput("");
     setShowGitWorkflow(false);
+    setUploadedFile(null);
     inputRef.current?.focus();
   };
 
@@ -269,7 +421,7 @@ export function Dashboard({ selectedTaskId, onTaskStarted }: DashboardProps) {
               <div className="p-4 rounded-full bg-primary/10">
                 <Bot className="h-12 w-12 text-primary" />
               </div>
-              <h2 className="text-2xl font-bold">AI Software Engineer</h2>
+              <h2 className="text-2xl font-bold">ASaaP Jr. Software Developer</h2>
               <p className="text-muted-foreground text-center max-w-md">
                 Describe what you want to build, fix, or improve. I'll research,
                 plan, write code, run tests, and create a pull request.
@@ -447,39 +599,106 @@ export function Dashboard({ selectedTaskId, onTaskStarted }: DashboardProps) {
       {/* ── Bottom Input Area ───────────────────────────────────── */}
       <div className="border-t bg-background/95 backdrop-blur">
         <div className="max-w-4xl mx-auto px-4 py-3 space-y-2">
-          {/* Repo input (toggleable) */}
+          {/* Repo selector (toggleable) */}
           {showRepoInput && (
-            <div className="flex items-center gap-2 p-2 rounded-lg border bg-card animate-fade-in-up">
-              <FolderGit2 className="h-4 w-4 text-primary shrink-0" />
-              <input
-                type="text"
-                placeholder="GitHub repo URL (e.g., https://github.com/owner/repo)"
-                value={repoUrl}
-                onChange={(e) => {
-                  setRepoUrl(e.target.value);
-                  const name = extractRepoName(e.target.value);
-                  if (name) setRepoNameInput(name);
-                }}
-                className="flex-1 bg-transparent text-sm placeholder:text-muted-foreground focus:outline-none"
-                disabled={submitting || !!activeTaskId}
-              />
-              {displayRepoName && (
-                <span className="text-xs text-green-500 flex items-center gap-1 shrink-0">
-                  <CheckCircle2 className="h-3 w-3" />
-                  {displayRepoName}
-                </span>
-              )}
+            <div className="rounded-lg border bg-card animate-fade-in-up relative">
+              <div className="flex items-center gap-2 p-2">
+                <FolderGit2 className="h-4 w-4 text-primary shrink-0" />
+                <div className="relative flex-1">
+                  <div className="flex items-center gap-2">
+                    <div className="relative flex-1">
+                      <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground pointer-events-none" />
+                      <input
+                        type="text"
+                        placeholder={githubRepos.length > 0 ? "Search repos or paste URL..." : "Paste GitHub repo URL..."}
+                        value={repoSearch || repoUrl}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setRepoSearch(val);
+                          if (val.includes("github.com/")) {
+                            setRepoUrl(val);
+                            const name = extractRepoName(val);
+                            if (name) setRepoNameInput(name);
+                            setRepoDropdownOpen(false);
+                          } else if (githubRepos.length > 0) {
+                            setRepoDropdownOpen(true);
+                          }
+                        }}
+                        onFocus={() => { if (githubRepos.length > 0) setRepoDropdownOpen(true); }}
+                        onBlur={() => { setTimeout(() => setRepoDropdownOpen(false), 200); }}
+                        className="w-full pl-8 pr-3 py-1.5 bg-transparent text-sm placeholder:text-muted-foreground focus:outline-none"
+                        disabled={submitting || !!activeTaskId}
+                      />
+                    </div>
+                    {githubRepos.length > 0 && !displayRepoName && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 text-xs shrink-0"
+                        onClick={() => setRepoDropdownOpen(!repoDropdownOpen)}
+                      >
+                        <ChevronDown className={`h-3 w-3 transition-transform ${repoDropdownOpen ? "rotate-180" : ""}`} />
+                      </Button>
+                    )}
+                    {displayRepoName && (
+                      <button
+                        onClick={() => { setRepoUrl(""); setRepoNameInput(""); setRepoSearch(""); }}
+                        className="text-xs text-green-500 flex items-center gap-1 shrink-0 hover:opacity-70"
+                      >
+                        <CheckCircle2 className="h-3 w-3" />
+                        {displayRepoName}
+                        <X className="h-2.5 w-2.5 ml-0.5" />
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Dropdown — opens upward */}
+                  {repoDropdownOpen && !activeTaskId && githubRepos.length > 0 && (
+                    <div className="absolute left-0 right-0 bottom-full mb-1 z-50 rounded-lg border bg-popover shadow-lg max-h-60 overflow-y-auto">
+                      {reposLoading && (
+                        <div className="flex items-center gap-2 p-3 text-sm text-muted-foreground">
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading repos...
+                        </div>
+                      )}
+                      {!reposLoading && filteredRepos.length === 0 && (
+                        <div className="p-3 text-xs text-muted-foreground">
+                          No repos match "{repoSearch}". Try a different search or paste a URL.
+                        </div>
+                      )}
+                      {!reposLoading && filteredRepos.map((repo) => (
+                        <button
+                          key={repo.full_name}
+                          onMouseDown={(e) => e.preventDefault()}
+                          onClick={() => selectRepo(repo)}
+                          className="w-full text-left px-3 py-2 hover:bg-accent flex items-center gap-2.5 border-b border-border/40 last:border-0 transition-colors"
+                        >
+                          {repo.private ? (
+                            <Lock className="h-3.5 w-3.5 text-yellow-500 shrink-0" />
+                          ) : (
+                            <Globe className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                          )}
+                          <div className="min-w-0 flex-1">
+                            <p className="text-sm font-medium truncate">{repo.full_name}</p>
+                            {repo.description && (
+                              <p className="text-[10px] text-muted-foreground truncate">{repo.description}</p>
+                            )}
+                          </div>
+                          <span className="text-[10px] text-muted-foreground shrink-0">{repo.default_branch}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
             </div>
           )}
 
           {/* Main input row */}
           <div className="flex items-end gap-2">
             <div className="flex items-center gap-1 pb-1">
-              {activeTaskId && (
-                <Button variant="ghost" size="icon" className="h-8 w-8" onClick={startNewChat} title="New task">
-                  <Plus className="h-4 w-4" />
-                </Button>
-              )}
+              <Button variant="ghost" size="icon" className="h-8 w-8" onClick={startNewChat} title="New task">
+                <Plus className="h-4 w-4" />
+              </Button>
               <Button
                 variant="ghost"
                 size="icon"
@@ -489,6 +708,23 @@ export function Dashboard({ selectedTaskId, onTaskStarted }: DashboardProps) {
               >
                 <FolderGit2 className="h-4 w-4" />
               </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                className={`h-8 w-8 ${uploadedFile ? "text-primary" : ""}`}
+                onClick={() => fileInputRef.current?.click()}
+                disabled={submitting || uploading}
+                title="Upload document for context"
+              >
+                {uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Paperclip className="h-4 w-4" />}
+              </Button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                className="hidden"
+                accept=".txt,.md,.py,.js,.ts,.jsx,.tsx,.json,.csv,.yaml,.yml,.xml,.html,.css,.sql,.sh,.bat,.cfg,.ini,.toml,.env,.log"
+                onChange={handleFileUpload}
+              />
             </div>
 
             {!activeTaskId && (
@@ -511,6 +747,20 @@ export function Dashboard({ selectedTaskId, onTaskStarted }: DashboardProps) {
             )}
 
             <div className="flex-1 relative">
+              {uploadedFile && (
+                <div className="flex items-center gap-1 mb-1 ml-1">
+                  <span className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-primary/10 text-primary font-medium">
+                    <Paperclip className="h-3 w-3" />
+                    {uploadedFile.name}
+                    <button
+                      onClick={() => setUploadedFile(null)}
+                      className="ml-0.5 hover:text-red-500 transition-colors"
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  </span>
+                </div>
+              )}
               <Textarea
                 ref={inputRef}
                 value={inputValue}

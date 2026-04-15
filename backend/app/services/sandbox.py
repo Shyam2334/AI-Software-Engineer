@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -177,6 +178,8 @@ class SandboxService:
 
         # Local fallback when Docker is unavailable
         if not self.docker_available:
+            # Install dependencies before running tests locally
+            await self._install_local_deps(project_path)
             return await self._run_local_command(local_test_command, project_path, timeout)
 
         image = SANDBOX_IMAGE if self._image_exists(SANDBOX_IMAGE) else "python:3.11-slim"
@@ -195,6 +198,7 @@ class SandboxService:
         # If Docker failed (non-timeout), retry with local execution
         if not result.success and not result.timed_out and not self.docker_available:
             logger.info("Retrying test execution locally after Docker failure")
+            await self._install_local_deps(project_path)
             return await self._run_local_command(local_test_command, project_path, timeout)
 
         return result
@@ -389,11 +393,43 @@ class SandboxService:
                 stdout_bytes, stderr_bytes = await asyncio.wait_for(
                     process.communicate(), timeout=timeout
                 )
-                return SandboxResult(
+                output = SandboxResult(
                     exit_code=process.returncode or 0,
                     stdout=stdout_bytes.decode("utf-8", errors="replace"),
                     stderr=stderr_bytes.decode("utf-8", errors="replace"),
                 )
+                # Auto-detect missing module errors and retry after installing
+                if not output.success:
+                    missing = self._detect_missing_modules(output.output)
+                    if missing:
+                        logger.info("Detected missing modules: %s — installing", missing)
+                        install_cmd = self._fix_command_for_local(
+                            f"pip install {' '.join(missing)}"
+                        )
+                        install_proc = await asyncio.create_subprocess_shell(
+                            install_cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            cwd=cwd,
+                        )
+                        await asyncio.wait_for(install_proc.communicate(), timeout=120)
+                        # Retry the original command
+                        logger.info("Retrying command after installing: %s", missing)
+                        process2 = await asyncio.create_subprocess_shell(
+                            command,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            cwd=cwd,
+                        )
+                        stdout2, stderr2 = await asyncio.wait_for(
+                            process2.communicate(), timeout=timeout
+                        )
+                        return SandboxResult(
+                            exit_code=process2.returncode or 0,
+                            stdout=stdout2.decode("utf-8", errors="replace"),
+                            stderr=stderr2.decode("utf-8", errors="replace"),
+                        )
+                return output
             except asyncio.TimeoutError:
                 process.kill()
                 return SandboxResult(
@@ -401,6 +437,63 @@ class SandboxService:
                 )
         except Exception as e:
             return SandboxResult(exit_code=1, stdout="", stderr=f"Local execution error: {e}")
+
+    async def _install_local_deps(self, project_path: str) -> None:
+        """Install dependencies from requirements.txt (or package.json) locally before tests."""
+        req_file = os.path.join(project_path, "requirements.txt")
+        if os.path.exists(req_file):
+            install_cmd = self._fix_command_for_local(f"pip install -r requirements.txt")
+            logger.info("Installing local deps: %s", install_cmd)
+            try:
+                proc = await asyncio.create_subprocess_shell(
+                    install_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=project_path,
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+                if proc.returncode != 0:
+                    logger.warning(
+                        "Dep install had errors: %s",
+                        stderr.decode("utf-8", errors="replace")[:500],
+                    )
+                else:
+                    logger.info("Dependencies installed successfully")
+            except Exception as e:
+                logger.warning("Failed to install deps: %s", e)
+
+        pkg_file = os.path.join(project_path, "package.json")
+        if os.path.exists(pkg_file) and not os.path.exists(
+            os.path.join(project_path, "node_modules")
+        ):
+            logger.info("Running npm install in %s", project_path)
+            try:
+                proc = await asyncio.create_subprocess_shell(
+                    "npm install",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=project_path,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=120)
+            except Exception as e:
+                logger.warning("npm install failed: %s", e)
+
+    @staticmethod
+    def _detect_missing_modules(output: str) -> list[str]:
+        """Parse test output for ModuleNotFoundError and return missing module names."""
+        import re
+        modules = re.findall(
+            r"ModuleNotFoundError: No module named ['\"]([^'\"]+)['\"]", output
+        )
+        # Deduplicate while preserving order; take top-level package name
+        seen = set()
+        result = []
+        for mod in modules:
+            top_level = mod.split(".")[0]
+            if top_level not in seen:
+                seen.add(top_level)
+                result.append(top_level)
+        return result
 
     async def _run_local_code(
         self,

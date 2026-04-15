@@ -136,18 +136,18 @@ function InlineApproval({ approval, onApprove, onReject }: ApprovalInlineProps) 
               {expanded && (
                 <div className="mt-2 space-y-2 text-xs">
                   {details.plan && (
-                    <ScrollArea className="max-h-[200px] rounded border border-border bg-background/50 p-3">
+                    <div className="max-h-[300px] overflow-y-auto rounded border border-border bg-background/50 p-3">
                       <pre className="whitespace-pre-wrap font-mono text-muted-foreground">
                         {String(details.plan)}
                       </pre>
-                    </ScrollArea>
+                    </div>
                   )}
                   {details.pr_description && (
-                    <ScrollArea className="max-h-[150px] rounded border border-border bg-background/50 p-3">
+                    <div className="max-h-[200px] overflow-y-auto rounded border border-border bg-background/50 p-3">
                       <pre className="whitespace-pre-wrap font-mono text-muted-foreground">
                         {String(details.pr_description)}
                       </pre>
-                    </ScrollArea>
+                    </div>
                   )}
                   {details.files_changed && Array.isArray(details.files_changed) && (
                     <div>
@@ -383,9 +383,19 @@ export function ExecutionTimeline({
                   {/* Phase header */}
                   {entry.isPhaseStart && entry.phase && (
                     <div className="flex items-center gap-2 mt-4 mb-2 first:mt-1">
-                      <div className="flex items-center gap-1.5 text-xs font-semibold text-primary uppercase tracking-wider">
-                        {PhaseIcon && <PhaseIcon className="h-3.5 w-3.5" />}
-                        {entry.phase}
+                      <div className="flex flex-col gap-0.5">
+                        <div className="flex items-center gap-1.5 text-xs font-semibold text-primary uppercase tracking-wider">
+                          {PhaseIcon && <PhaseIcon className="h-3.5 w-3.5" />}
+                          {entry.phase}
+                        </div>
+                        {(() => {
+                          const phaseInfo = PHASES.find((p) => p.key === entry.phase);
+                          return phaseInfo ? (
+                            <span className="text-[11px] text-muted-foreground ml-5">
+                              {phaseInfo.description}
+                            </span>
+                          ) : null;
+                        })()}
                       </div>
                       <div className="flex-1 h-px bg-border" />
                     </div>

@@ -9,7 +9,7 @@ from typing import AsyncGenerator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import plugins, tasks, websocket
+from app.api import connectors, plugins, tasks, websocket
 from app.config import get_settings
 from app.database import close_db, init_db
 
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
     """Startup and shutdown events."""
-    logger.info("Starting AI Software Engineer backend...")
+    logger.info("Starting ASaaP Jr. Software Developer backend...")
     logger.info(
         "Config: anthropic_key=%s, gemini_key=%s",
         "set" if settings.anthropic_api_key else "MISSING",
@@ -39,8 +39,8 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
 
 
 app = FastAPI(
-    title="AI Software Engineer",
-    description="Autonomous AI Software Engineer with multi-agent orchestration",
+    title="ASaaP Jr. Software Developer",
+    description="Autonomous AI-powered software development with multi-agent orchestration",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -57,6 +57,7 @@ app.add_middleware(
 # Routers
 app.include_router(tasks.router, prefix="/api/tasks", tags=["tasks"])
 app.include_router(plugins.router, prefix="/api/plugins", tags=["plugins"])
+app.include_router(connectors.router, prefix="/api/connectors", tags=["connectors"])
 app.include_router(websocket.router, tags=["websocket"])
 
 
@@ -70,7 +71,7 @@ async def health_check() -> dict:
 async def root() -> dict:
     """Root endpoint."""
     return {
-        "message": "AI Software Engineer API",
+        "message": "ASaaP Jr. Software Developer API",
         "version": "1.0.0",
         "docs": "/docs",
     }
