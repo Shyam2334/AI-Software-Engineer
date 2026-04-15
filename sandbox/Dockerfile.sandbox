@@ -1,0 +1,36 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    build-essential \
+    && curl -fsSL https://deb.nodesource.com/setup_18.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install common Python packages
+RUN pip install --no-cache-dir \
+    pytest \
+    pytest-asyncio \
+    pytest-cov \
+    black \
+    flake8 \
+    mypy \
+    playwright
+
+# Install Playwright browsers
+RUN playwright install --with-deps chromium
+
+# Install common Node.js tools
+RUN npm install -g typescript ts-node jest
+
+WORKDIR /workspace
+
+# Run as non-root user
+RUN useradd -m sandbox
+USER sandbox
+
+CMD ["bash"]
