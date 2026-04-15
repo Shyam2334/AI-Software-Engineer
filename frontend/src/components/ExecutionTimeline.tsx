@@ -1,5 +1,4 @@
-import { useEffect, useRef, useState } from "react";
-import { ScrollArea } from "@/components/ui/scroll-area";
+import { useEffect, useRef, useState, useMemo } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Search,
@@ -15,9 +14,10 @@ import {
   XCircle,
   Loader2,
   AlertTriangle,
-  ChevronRight,
+  ChevronDown,
   ShieldAlert,
   Clock,
+  Circle,
 } from "lucide-react";
 import type { WSMessage } from "@/hooks/useAgentWebSocket";
 import { cn } from "@/lib/utils";
@@ -28,33 +28,39 @@ interface PhaseInfo {
   key: string;
   label: string;
   icon: React.ElementType;
-  description: string;
 }
 
 const PHASES: PhaseInfo[] = [
-  { key: "research", label: "Research", icon: Search, description: "Searching codebase and documentation" },
-  { key: "analyze", label: "Analyze", icon: BrainCircuit, description: "Understanding task requirements" },
-  { key: "plan", label: "Plan", icon: ClipboardList, description: "Creating implementation plan" },
-  { key: "code", label: "Code", icon: Code2, description: "Generating code changes" },
-  { key: "test", label: "Test", icon: TestTube2, description: "Running tests" },
-  { key: "revise", label: "Revise", icon: RefreshCw, description: "Fixing issues from test failures" },
-  { key: "document", label: "Document", icon: FileText, description: "Generating documentation" },
-  { key: "create_pr", label: "Pull Request", icon: GitPullRequest, description: "Creating pull request" },
+  { key: "setup", label: "Setup", icon: ClipboardList },
+  { key: "research", label: "Research", icon: Search },
+  { key: "analyze", label: "Analyze", icon: BrainCircuit },
+  { key: "plan", label: "Plan", icon: ClipboardList },
+  { key: "code", label: "Code", icon: Code2 },
+  { key: "test", label: "Test", icon: TestTube2 },
+  { key: "revise", label: "Revise", icon: RefreshCw },
+  { key: "document", label: "Document", icon: FileText },
+  { key: "approve_pr", label: "Approve PR", icon: ShieldAlert },
+  { key: "create_pr", label: "Pull Request", icon: GitPullRequest },
+  { key: "complete", label: "Complete", icon: CheckCircle2 },
+  { key: "failed", label: "Failed", icon: XCircle },
 ];
 
-function getPhaseIndex(phaseKey: string): number {
-  return PHASES.findIndex((p) => p.key === phaseKey);
+function getPhaseInfo(key: string): PhaseInfo | undefined {
+  return PHASES.find((p) => p.key === key);
 }
 
 // ── Types ────────────────────────────────────────────────────────────
 
-interface TimelineEntry {
-  id: number;
-  time: string;
-  phase: string;
-  level: string;
+interface LogEntry {
   message: string;
-  isPhaseStart?: boolean;
+  level: string;
+  time: string;
+}
+
+interface PhaseGroup {
+  phase: string;
+  logs: LogEntry[];
+  status: "done" | "active" | "upcoming" | "failed";
 }
 
 interface ApprovalInlineProps {
@@ -72,32 +78,96 @@ interface ExecutionTimelineProps {
   onReject: (id: number) => void;
 }
 
-// ── Helper: level icon & colours ─────────────────────────────────────
+// ── Extract key highlights from logs ─────────────────────────────────
 
-function levelStyles(level: string) {
-  switch (level) {
-    case "success":
-      return { color: "text-green-400", bg: "bg-green-500/10", border: "border-green-500/30" };
-    case "error":
-      return { color: "text-red-400", bg: "bg-red-500/10", border: "border-red-500/30" };
-    case "warning":
-      return { color: "text-yellow-400", bg: "bg-yellow-500/10", border: "border-yellow-500/30" };
-    default:
-      return { color: "text-blue-400", bg: "bg-blue-500/10", border: "border-blue-500/30" };
-  }
-}
+function extractHighlights(logs: LogEntry[]): string[] {
+  const highlights: string[] = [];
 
-function levelIcon(level: string) {
-  switch (level) {
-    case "success":
-      return <CheckCircle2 className="h-3.5 w-3.5 text-green-400" />;
-    case "error":
-      return <XCircle className="h-3.5 w-3.5 text-red-400" />;
-    case "warning":
-      return <AlertTriangle className="h-3.5 w-3.5 text-yellow-400" />;
-    default:
-      return <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />;
+  for (const log of logs) {
+    const msg = log.message;
+
+    // Research phase
+    if (msg.startsWith("Reading (")) {
+      const match = msg.match(/Reading \(\d+\/\d+\): (.+)/);
+      if (match) highlights.push(`Read: ${match[1]}`);
+    } else if (/Gathered \d+ resource/.test(msg)) {
+      highlights.push(msg);
+    } else if (/Including uploaded document/.test(msg)) {
+      highlights.push("Included uploaded document as context");
+    } else if (/No search results found/.test(msg)) {
+      highlights.push("Proceeding with built-in knowledge");
+    }
+    // Analyze phase
+    else if (/Analysis complete/.test(msg)) {
+      highlights.push(msg);
+    } else if (/Image analysis complete/.test(msg)) {
+      highlights.push("Analyzed attached images for visual context");
+    } else if (/Found \d+ files in project/.test(msg)) {
+      highlights.push(msg);
+    } else if (/Scanning project files/.test(msg)) {
+      highlights.push("Scanned project structure");
+    }
+    // Plan phase
+    else if (/Implementation plan ready/.test(msg)) {
+      highlights.push("Implementation plan ready for review");
+    } else if (/Plan approved/.test(msg)) {
+      highlights.push("Plan approved — proceeding to code");
+    } else if (/Plan rejected/.test(msg)) {
+      highlights.push("Plan rejected by reviewer");
+    }
+    // Code phase
+    else if (/Loaded \d+ existing file/.test(msg)) {
+      highlights.push(msg.replace(/\s*as context.*/, " for context"));
+    } else if (/Generated \d+ file/.test(msg)) {
+      highlights.push(msg);
+    } else if (/Wrote: /.test(msg)) {
+      const match = msg.match(/Wrote: (.+?)(?:\s+\(|$)/);
+      if (match) highlights.push(`Wrote ${match[1]}`);
+    } else if (/All files written/.test(msg)) {
+      highlights.push("All files written to project");
+    } else if (/Regenerating code/.test(msg)) {
+      highlights.push(msg.split("—")[0].trim());
+    }
+    // Test phase
+    else if (/All tests passed/.test(msg)) {
+      highlights.push("All tests passed");
+    } else if (/\d+ test.*failed/i.test(msg)) {
+      highlights.push(msg.split(".")[0]);
+    } else if (/Executing:/.test(msg)) {
+      highlights.push(msg);
+    }
+    // Document phase
+    else if (/Documentation and PR description ready/.test(msg)) {
+      highlights.push("Documentation and PR description ready");
+    }
+    // PR phase
+    else if (/Committed:/.test(msg)) {
+      highlights.push(msg);
+    } else if (/Branch pushed/.test(msg)) {
+      highlights.push("Branch pushed to remote");
+    } else if (/Pull request created/i.test(msg) || /PR #\d+/.test(msg)) {
+      highlights.push(msg);
+    } else if (/Staging and committing/.test(msg)) {
+      highlights.push("Staged and committed generated files");
+    }
+    // Setup phase
+    else if (/Pulled latest code/.test(msg)) {
+      highlights.push(msg.split("and")[0].trim() || msg);
+    } else if (/created working branch/.test(msg)) {
+      const match = msg.match(/branch: (.+)/);
+      highlights.push(match ? `Created branch: ${match[1]}` : "Created working branch");
+    }
+    // Complete / fail
+    else if (/Task completed successfully/.test(msg)) {
+      highlights.push("Task completed successfully");
+    }
+    // Errors (always show)
+    else if (log.level === "error") {
+      highlights.push(msg.length > 120 ? msg.slice(0, 117) + "..." : msg);
+    }
   }
+
+  return highlights;
 }
 
 // ── Inline Approval Card ─────────────────────────────────────────────
@@ -109,7 +179,7 @@ function InlineApproval({ approval, onApprove, onReject }: ApprovalInlineProps) 
   const [expanded, setExpanded] = useState(false);
 
   return (
-    <div className="ml-8 my-3 rounded-lg border-2 border-yellow-500/40 bg-yellow-500/5 p-4 animate-fade-in-up">
+    <div className="ml-10 my-3 rounded-lg border-2 border-yellow-500/40 bg-yellow-500/5 p-4 animate-fade-in-up">
       <div className="flex items-start gap-3">
         <ShieldAlert className="h-5 w-5 text-yellow-400 mt-0.5 shrink-0" />
         <div className="flex-1 min-w-0 space-y-2">
@@ -124,7 +194,6 @@ function InlineApproval({ approval, onApprove, onReject }: ApprovalInlineProps) 
             <p className="text-xs text-muted-foreground">{approval.description}</p>
           )}
 
-          {/* Expandable details */}
           {(details.plan || details.pr_description || details.files_changed) && (
             <>
               <button
@@ -169,7 +238,6 @@ function InlineApproval({ approval, onApprove, onReject }: ApprovalInlineProps) 
             </>
           )}
 
-          {/* Action buttons */}
           <div className="flex items-center gap-2 pt-1">
             <Button
               size="sm"
@@ -195,67 +263,180 @@ function InlineApproval({ approval, onApprove, onReject }: ApprovalInlineProps) 
   );
 }
 
-// ── Workflow Steps (horizontal pipeline) ─────────────────────────────
+// ── Phase Step (todo-style card) ─────────────────────────────────────
 
-function WorkflowSteps({ currentPhase, status }: { currentPhase: string; status: string }) {
-  const activeIdx = getPhaseIndex(currentPhase);
-  const isComplete = status === "completed";
-  const isFailed = status === "failed";
+function PhaseStep({
+  group,
+  isLast,
+}: {
+  group: PhaseGroup;
+  isLast: boolean;
+}) {
+  const [showLogs, setShowLogs] = useState(false);
+  const info = getPhaseInfo(group.phase);
+  const highlights = useMemo(() => extractHighlights(group.logs), [group.logs]);
+
+  // Latest message for active phase
+  const latestLog = group.status === "active" && group.logs.length > 0
+    ? group.logs[group.logs.length - 1].message
+    : null;
+
+  const s = {
+    done: {
+      icon: "text-green-400",
+      ring: "ring-green-500/30 bg-green-500/10",
+      line: "bg-green-500/40",
+      label: "text-foreground",
+    },
+    active: {
+      icon: "text-primary",
+      ring: "ring-primary/30 bg-primary/10",
+      line: "bg-border",
+      label: "text-foreground",
+    },
+    upcoming: {
+      icon: "text-muted-foreground/40",
+      ring: "ring-border bg-muted/20",
+      line: "bg-border/50",
+      label: "text-muted-foreground",
+    },
+    failed: {
+      icon: "text-red-400",
+      ring: "ring-red-500/30 bg-red-500/10",
+      line: "bg-red-500/40",
+      label: "text-red-400",
+    },
+  }[group.status];
 
   return (
-    <div className="flex items-center gap-0.5 overflow-x-auto pb-1 px-1">
-      {PHASES.map((phase, idx) => {
-        const Icon = phase.icon;
-        let state: "done" | "active" | "upcoming" | "failed" = "upcoming";
-        if (isComplete) {
-          state = "done";
-        } else if (isFailed && idx === activeIdx) {
-          state = "failed";
-        } else if (idx < activeIdx) {
-          state = "done";
-        } else if (idx === activeIdx) {
-          state = "active";
-        }
+    <div className="flex gap-3">
+      {/* Vertical timeline connector */}
+      <div className="flex flex-col items-center">
+        <div className={cn("h-7 w-7 rounded-full flex items-center justify-center ring-2 shrink-0", s.ring)}>
+          {group.status === "active" ? (
+            <Loader2 className={cn("h-3.5 w-3.5 animate-spin", s.icon)} />
+          ) : group.status === "done" ? (
+            <CheckCircle2 className={cn("h-3.5 w-3.5", s.icon)} />
+          ) : group.status === "failed" ? (
+            <XCircle className={cn("h-3.5 w-3.5", s.icon)} />
+          ) : (
+            <Circle className={cn("h-3 w-3", s.icon)} />
+          )}
+        </div>
+        {!isLast && <div className={cn("w-px flex-1 min-h-[16px]", s.line)} />}
+      </div>
 
-        const stateStyles = {
-          done: "bg-green-500/15 border-green-500/40 text-green-400",
-          active: "bg-primary/15 border-primary/40 text-primary",
-          upcoming: "bg-muted/30 border-border text-muted-foreground",
-          failed: "bg-red-500/15 border-red-500/40 text-red-400",
-        };
+      {/* Content */}
+      <div className={cn("flex-1 min-w-0 pb-5", isLast && "pb-1")}>
+        {/* Phase title row */}
+        <div className="flex items-center gap-2 h-7">
+          <span className={cn("text-sm font-medium", s.label)}>
+            {info?.label || group.phase}
+          </span>
+          {group.status === "done" && (
+            <span className="text-[10px] text-green-400/70 font-medium">Done</span>
+          )}
+          {group.status === "active" && (
+            <span className="text-[10px] text-primary/70 font-medium animate-pulse">In Progress</span>
+          )}
+          {group.status === "failed" && (
+            <span className="text-[10px] text-red-400/70 font-medium">Failed</span>
+          )}
+        </div>
 
-        return (
-          <div key={phase.key} className="flex items-center">
-            <div
-              className={cn(
-                "flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium transition-all duration-300",
-                stateStyles[state],
-                state === "active" && "ring-1 ring-primary/30 shadow-sm shadow-primary/10"
-              )}
-              title={phase.description}
-            >
-              {state === "active" ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : state === "done" ? (
-                <CheckCircle2 className="h-3.5 w-3.5" />
-              ) : state === "failed" ? (
-                <XCircle className="h-3.5 w-3.5" />
-              ) : (
-                <Icon className="h-3.5 w-3.5" />
-              )}
-              <span className="hidden sm:inline">{phase.label}</span>
-            </div>
-            {idx < PHASES.length - 1 && (
-              <div
-                className={cn(
-                  "w-4 h-px mx-0.5",
-                  idx < activeIdx || isComplete ? "bg-green-500/50" : "bg-border"
-                )}
-              />
+        {/* Active: show current activity */}
+        {group.status === "active" && latestLog && (
+          <p className="text-xs text-muted-foreground mt-1 leading-relaxed animate-fade-in-up">
+            {latestLog}
+          </p>
+        )}
+
+        {/* Completed: show highlight summary */}
+        {group.status === "done" && highlights.length > 0 && (
+          <div className="mt-1.5 space-y-1">
+            {highlights.slice(0, 4).map((h, i) => (
+              <div key={i} className="flex items-start gap-1.5">
+                <CheckCircle2 className="h-3 w-3 text-green-400/60 mt-0.5 shrink-0" />
+                <span className="text-xs text-muted-foreground leading-relaxed">{h}</span>
+              </div>
+            ))}
+            {highlights.length > 4 && (
+              <button
+                onClick={() => setShowLogs(!showLogs)}
+                className="text-[11px] text-primary/70 hover:text-primary ml-[18px] flex items-center gap-0.5"
+              >
+                +{highlights.length - 4} more
+                <ChevronDown className={cn("h-3 w-3 transition-transform", showLogs && "rotate-180")} />
+              </button>
             )}
+            {showLogs && highlights.slice(4).map((h, i) => (
+              <div key={`more-${i}`} className="flex items-start gap-1.5">
+                <CheckCircle2 className="h-3 w-3 text-green-400/60 mt-0.5 shrink-0" />
+                <span className="text-xs text-muted-foreground leading-relaxed">{h}</span>
+              </div>
+            ))}
           </div>
-        );
-      })}
+        )}
+
+        {/* Completed phase with no highlights — show one-liner */}
+        {group.status === "done" && highlights.length === 0 && group.logs.length > 0 && (
+          <p className="text-xs text-muted-foreground/60 mt-0.5">
+            {group.logs[group.logs.length - 1].message}
+          </p>
+        )}
+
+        {/* Failed: show errors */}
+        {group.status === "failed" && (
+          <div className="mt-1.5 space-y-1">
+            {group.logs
+              .filter((l) => l.level === "error" || l.level === "warning")
+              .slice(-3)
+              .map((log, i) => (
+                <div key={i} className="flex items-start gap-1.5">
+                  {log.level === "error" ? (
+                    <XCircle className="h-3 w-3 text-red-400/60 mt-0.5 shrink-0" />
+                  ) : (
+                    <AlertTriangle className="h-3 w-3 text-yellow-400/60 mt-0.5 shrink-0" />
+                  )}
+                  <span className="text-xs text-muted-foreground leading-relaxed">
+                    {log.message.length > 150 ? log.message.slice(0, 147) + "..." : log.message}
+                  </span>
+                </div>
+              ))}
+          </div>
+        )}
+
+        {/* Expandable raw logs */}
+        {(group.status === "done" || group.status === "failed") && group.logs.length > 0 && (
+          <button
+            onClick={() => setShowLogs(!showLogs)}
+            className="text-[11px] text-muted-foreground/40 hover:text-muted-foreground mt-1.5 flex items-center gap-0.5 transition-colors"
+          >
+            {showLogs ? "Hide logs" : `View ${group.logs.length} log entries`}
+            <ChevronDown className={cn("h-3 w-3 transition-transform", showLogs && "rotate-180")} />
+          </button>
+        )}
+        {showLogs && (group.status === "done" || group.status === "failed") && (
+          <div className="mt-2 space-y-0.5 pl-1 border-l-2 border-border/50">
+            {group.logs.map((log, i) => (
+              <div key={i} className="flex items-start gap-2 py-0.5 pl-2">
+                <span className="text-[10px] text-muted-foreground/50 shrink-0 tabular-nums w-[60px]">
+                  {log.time}
+                </span>
+                <span className={cn(
+                  "text-[11px] leading-relaxed",
+                  log.level === "error" ? "text-red-400/80" :
+                  log.level === "warning" ? "text-yellow-400/80" :
+                  log.level === "success" ? "text-green-400/80" :
+                  "text-muted-foreground/60"
+                )}>
+                  {log.message}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -274,43 +455,66 @@ export function ExecutionTimeline({
   const [autoScroll, setAutoScroll] = useState(true);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // Derive current phase from the latest log with a phase
-  const currentPhase = (() => {
+  // Current phase from latest log
+  const currentPhase = useMemo(() => {
     for (let i = logs.length - 1; i >= 0; i--) {
       if (logs[i].phase) return logs[i].phase!;
     }
     return "";
-  })();
+  }, [logs]);
 
-  // Build timeline entries with phase grouping
-  const entries: TimelineEntry[] = [];
-  let lastPhase = "";
-  logs.forEach((log, idx) => {
-    const phase = log.phase || lastPhase;
-    const isPhaseStart = phase !== lastPhase;
-    if (phase) lastPhase = phase;
+  // Group logs by phase
+  const phaseGroups: PhaseGroup[] = useMemo(() => {
+    const groups: PhaseGroup[] = [];
+    let currentGroupPhase = "";
 
-    entries.push({
-      id: idx,
-      time: log.timestamp ? new Date(log.timestamp).toLocaleTimeString() : "",
-      phase,
-      level: log.level || "info",
-      message: log.message || "",
-      isPhaseStart,
-    });
-  });
+    for (const log of logs) {
+      const phase = log.phase || currentGroupPhase;
+      if (!phase) continue;
 
-  // Auto-scroll behaviour
-  useEffect(() => {
-    if (autoScroll) {
-      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+      if (phase !== currentGroupPhase) {
+        groups.push({ phase, logs: [], status: "active" });
+        currentGroupPhase = phase;
+      }
+
+      const group = groups[groups.length - 1];
+      if (group) {
+        group.logs.push({
+          message: log.message || "",
+          level: log.level || "info",
+          time: log.timestamp
+            ? new Date(log.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })
+            : "",
+        });
+      }
     }
+
+    // Set statuses
+    const activePhaseIdx = groups.findIndex((g) => g.phase === currentPhase);
+    const isCompleted = currentStatus === "completed";
+    const isFailed = currentStatus === "failed";
+
+    groups.forEach((g, idx) => {
+      if (isCompleted) {
+        g.status = "done";
+      } else if (isFailed) {
+        g.status = idx < activePhaseIdx ? "done" : idx === activePhaseIdx ? "failed" : "upcoming";
+      } else {
+        g.status = idx < activePhaseIdx ? "done" : idx === activePhaseIdx ? "active" : "upcoming";
+      }
+    });
+
+    return groups;
+  }, [logs, currentPhase, currentStatus]);
+
+  // Auto-scroll
+  useEffect(() => {
+    if (autoScroll) bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [logs, autoScroll, approval]);
 
   const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
     const el = e.currentTarget;
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
-    setAutoScroll(atBottom);
+    setAutoScroll(el.scrollHeight - el.scrollTop - el.clientHeight < 60);
   };
 
   const isEmpty = logs.length === 0;
@@ -318,7 +522,7 @@ export function ExecutionTimeline({
 
   return (
     <div className="rounded-lg border bg-card overflow-hidden">
-      {/* Workflow Steps Header */}
+      {/* Header */}
       <div className="border-b bg-muted/30 px-4 py-3">
         <div className="flex items-center justify-between mb-2">
           <div className="flex items-center gap-2">
@@ -346,7 +550,7 @@ export function ExecutionTimeline({
         </div>
 
         {/* Progress bar */}
-        <div className="h-1 rounded-full bg-muted overflow-hidden mb-3">
+        <div className="h-1 rounded-full bg-muted overflow-hidden">
           <div
             className={cn(
               "h-full rounded-full transition-all duration-500 ease-out",
@@ -356,90 +560,32 @@ export function ExecutionTimeline({
             style={{ width: `${progress}%` }}
           />
         </div>
-
-        {/* Horizontal step indicators */}
-        <WorkflowSteps currentPhase={currentPhase} status={currentStatus} />
       </div>
 
-      {/* Timeline Body */}
+      {/* Timeline body */}
       <div
         ref={scrollRef}
         onScroll={handleScroll}
-        className="h-[420px] overflow-y-auto"
+        className="max-h-[500px] overflow-y-auto"
       >
         {isEmpty ? (
-          <div className="flex flex-col items-center justify-center h-full text-muted-foreground gap-2">
+          <div className="flex flex-col items-center justify-center py-16 text-muted-foreground gap-2">
             <Clock className="h-8 w-8 opacity-40" />
             <p className="text-sm">Waiting for task execution...</p>
           </div>
         ) : (
-          <div className="px-4 py-3 space-y-0">
-            {entries.map((entry) => {
-              const styles = levelStyles(entry.level);
-              const PhaseIcon = PHASES.find((p) => p.key === entry.phase)?.icon;
-
-              return (
-                <div key={entry.id}>
-                  {/* Phase header */}
-                  {entry.isPhaseStart && entry.phase && (
-                    <div className="flex items-center gap-2 mt-4 mb-2 first:mt-1">
-                      <div className="flex flex-col gap-0.5">
-                        <div className="flex items-center gap-1.5 text-xs font-semibold text-primary uppercase tracking-wider">
-                          {PhaseIcon && <PhaseIcon className="h-3.5 w-3.5" />}
-                          {entry.phase}
-                        </div>
-                        {(() => {
-                          const phaseInfo = PHASES.find((p) => p.key === entry.phase);
-                          return phaseInfo ? (
-                            <span className="text-[11px] text-muted-foreground ml-5">
-                              {phaseInfo.description}
-                            </span>
-                          ) : null;
-                        })()}
-                      </div>
-                      <div className="flex-1 h-px bg-border" />
-                    </div>
-                  )}
-
-                  {/* Log entry */}
-                  <div className="flex items-start gap-2 py-1 group">
-                    {/* Timestamp */}
-                    <span className="text-[11px] text-muted-foreground shrink-0 tabular-nums pt-0.5 w-[70px]">
-                      {entry.time}
-                    </span>
-
-                    {/* Vertical line + dot */}
-                    <div className="flex flex-col items-center shrink-0 pt-1">
-                      <div className={cn("h-2 w-2 rounded-full", styles.bg, "ring-1", styles.border)} />
-                    </div>
-
-                    {/* Level icon + message */}
-                    <div className={cn("flex items-start gap-1.5 text-sm min-w-0 py-0.5 px-2 rounded", "group-hover:bg-muted/30 transition-colors")}>
-                      {levelIcon(entry.level)}
-                      <span className="break-words text-foreground/90 leading-relaxed">
-                        {entry.message}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-
-            {/* Inline Approval inside timeline */}
-            {approval && (
-              <InlineApproval
-                approval={approval}
-                onApprove={onApprove}
-                onReject={onReject}
+          <div className="px-4 py-4">
+            {phaseGroups.map((group, idx) => (
+              <PhaseStep
+                key={`${group.phase}-${idx}`}
+                group={group}
+                isLast={idx === phaseGroups.length - 1 && !approval && !isActive}
               />
-            )}
+            ))}
 
-            {/* Spinner at bottom while active */}
-            {isActive && !approval && (
-              <div className="flex items-center gap-2 py-3 pl-20 text-muted-foreground">
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                <span className="text-xs">Working...</span>
-              </div>
+            {/* Inline approval */}
+            {approval && (
+              <InlineApproval approval={approval} onApprove={onApprove} onReject={onReject} />
             )}
 
             <div ref={bottomRef} />
@@ -447,7 +593,7 @@ export function ExecutionTimeline({
         )}
       </div>
 
-      {/* Scroll-to-bottom indicator */}
+      {/* Scroll-to-bottom */}
       {!autoScroll && logs.length > 0 && (
         <div className="border-t px-4 py-1.5 bg-muted/30 flex justify-center">
           <button

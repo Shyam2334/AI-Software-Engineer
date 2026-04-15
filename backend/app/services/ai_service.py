@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 from typing import Any, Dict, List, Optional
@@ -151,6 +152,82 @@ class AIService:
             system_prompt=system,
             user_message=user_msg,
         )
+
+    async def claude_vision_analyze(
+        self,
+        images: List[Dict[str, str]],
+        user_message: str,
+        system_prompt: str = "",
+    ) -> str:
+        """Analyze images using Claude's vision capabilities.
+
+        Args:
+            images: List of dicts with 'data' (base64) and 'media_type' keys.
+            user_message: The user's question/instructions about the images.
+            system_prompt: Optional system instructions.
+
+        Returns:
+            Claude's analysis of the images.
+        """
+        if not system_prompt:
+            system_prompt = (
+                "You are an expert UI/UX designer and software engineer. "
+                "Analyze the provided image(s) carefully. If they show UI screenshots, "
+                "identify design issues, layout problems, visual bugs, accessibility concerns, "
+                "and suggest specific fixes with code changes. If the images show error messages, "
+                "stack traces, or diagrams, interpret them accurately. "
+                "Be specific about element positions, colors, spacing, and any issues you find."
+            )
+
+        # Build multimodal content blocks
+        content_blocks: List[Dict[str, Any]] = []
+
+        for i, img in enumerate(images):
+            content_blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": img.get("media_type", "image/png"),
+                    "data": img["data"],
+                },
+            })
+            if len(images) > 1:
+                content_blocks.append({
+                    "type": "text",
+                    "text": f"[Image {i + 1} of {len(images)}]",
+                })
+
+        content_blocks.append({
+            "type": "text",
+            "text": user_message,
+        })
+
+        try:
+            response = await self.anthropic.messages.create(
+                model=settings.claude_model,
+                max_tokens=settings.claude_max_tokens,
+                temperature=0.3,
+                system=system_prompt,
+                messages=[{"role": "user", "content": content_blocks}],
+            )
+
+            text_parts: List[str] = []
+            for block in response.content:
+                if block.type == "text":
+                    text_parts.append(block.text)
+
+            result = "\n".join(text_parts)
+            logger.info(
+                "Claude vision response: %d chars, %d image(s), usage: %s",
+                len(result),
+                len(images),
+                response.usage,
+            )
+            return result
+
+        except anthropic.APIError as e:
+            logger.error("Claude Vision API error: %s", e)
+            raise
 
     # ── Gemini Methods ──────────────────────────────────────────────────
 

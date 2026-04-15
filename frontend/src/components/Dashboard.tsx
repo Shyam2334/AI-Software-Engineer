@@ -25,6 +25,7 @@ import {
   Search,
   Lock,
   Globe,
+  ImagePlus,
 } from "lucide-react";
 
 interface GitHubRepo {
@@ -40,6 +41,12 @@ interface GitHubRepo {
 
 type TaskType = "feature" | "bugfix" | "test" | "enhancement" | "refactor" | "docs";
 
+interface AttachedImage {
+  id: string;
+  file: File;
+  dataUrl: string; // base64 data URL for preview
+}
+
 interface ChatMessage {
   id: string;
   role: "user" | "agent" | "system";
@@ -49,6 +56,7 @@ interface ChatMessage {
   taskType?: TaskType;
   repoUrl?: string;
   repoName?: string;
+  images?: string[]; // data URLs for display in chat history
 }
 
 interface DashboardProps {
@@ -86,10 +94,12 @@ export function Dashboard({ selectedTaskId, onTaskStarted }: DashboardProps) {
   const [reposLoading, setReposLoading] = useState(false);
   const [repoSearch, setRepoSearch] = useState("");
   const [repoDropdownOpen, setRepoDropdownOpen] = useState(false);
+  const [attachedImages, setAttachedImages] = useState<AttachedImage[]>([]);
 
   const chatEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
 
   const {
     connected,
@@ -241,6 +251,57 @@ export function Dashboard({ selectedTaskId, onTaskStarted }: DashboardProps) {
     setRepoSearch("");
   };
 
+  // ── Image handling ──────────────────────────────────────────
+
+  const addImageFiles = useCallback((files: FileList | File[]) => {
+    const imageFiles = Array.from(files).filter((f) => f.type.startsWith("image/"));
+    if (imageFiles.length === 0) return;
+
+    imageFiles.forEach((file) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = reader.result as string;
+        setAttachedImages((prev) => [
+          ...prev,
+          { id: `img-${Date.now()}-${Math.random().toString(36).slice(2)}`, file, dataUrl },
+        ]);
+      };
+      reader.readAsDataURL(file);
+    });
+  }, []);
+
+  const removeImage = useCallback((id: string) => {
+    setAttachedImages((prev) => prev.filter((img) => img.id !== id));
+  }, []);
+
+  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files) addImageFiles(e.target.files);
+    if (imageInputRef.current) imageInputRef.current.value = "";
+  };
+
+  // Clipboard paste handler for images
+  const handlePaste = useCallback(
+    (e: React.ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+
+      const imageItems: File[] = [];
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.type.startsWith("image/")) {
+          const file = item.getAsFile();
+          if (file) imageItems.push(file);
+        }
+      }
+
+      if (imageItems.length > 0) {
+        e.preventDefault(); // prevent pasting image as text
+        addImageFiles(imageItems);
+      }
+    },
+    [addImageFiles]
+  );
+
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chatMessages, logs, approvalRequest]);
@@ -251,6 +312,9 @@ export function Dashboard({ selectedTaskId, onTaskStarted }: DashboardProps) {
     const message = inputValue.trim();
     if (!message || submitting) return;
 
+    // Collect image data URLs for chat display
+    const imageDataUrls = attachedImages.map((img) => img.dataUrl);
+
     const userMsg: ChatMessage = {
       id: `msg-${Date.now()}`,
       role: "user",
@@ -259,9 +323,18 @@ export function Dashboard({ selectedTaskId, onTaskStarted }: DashboardProps) {
       taskType,
       repoUrl: repoUrl || undefined,
       repoName: repoNameInput || undefined,
+      images: imageDataUrls.length > 0 ? imageDataUrls : undefined,
     };
     setChatMessages((prev) => [...prev, userMsg]);
     setInputValue("");
+
+    // Build image_data array: [{data: base64, media_type: "image/png"}, ...]
+    const imagePayload = attachedImages.map((img) => {
+      const [meta, base64] = img.dataUrl.split(",");
+      const mediaType = meta?.match(/data:(image\/[^;]+)/)?.[1] || "image/png";
+      return { data: base64, media_type: mediaType };
+    });
+    setAttachedImages([]);
 
     if (!activeTaskId) {
       setSubmitting(true);
@@ -280,6 +353,7 @@ export function Dashboard({ selectedTaskId, onTaskStarted }: DashboardProps) {
             repo_url: repoUrl.trim() || undefined,
             repo_name: repoNameInput.trim() || undefined,
             document_context: uploadedFile?.content || undefined,
+            image_data: imagePayload.length > 0 ? imagePayload : undefined,
           }),
         });
 
@@ -338,6 +412,7 @@ export function Dashboard({ selectedTaskId, onTaskStarted }: DashboardProps) {
             repo_url: repoUrl.trim() || undefined,
             repo_name: repoNameInput.trim() || undefined,
             document_context: uploadedFile?.content || undefined,
+            image_data: imagePayload.length > 0 ? imagePayload : undefined,
           }),
         });
 
@@ -404,6 +479,7 @@ export function Dashboard({ selectedTaskId, onTaskStarted }: DashboardProps) {
     setRepoNameInput("");
     setShowGitWorkflow(false);
     setUploadedFile(null);
+    setAttachedImages([]);
     inputRef.current?.focus();
   };
 
@@ -477,6 +553,19 @@ export function Dashboard({ selectedTaskId, onTaskStarted }: DashboardProps) {
                     )}
                     <div className="rounded-2xl rounded-tr-md bg-primary text-primary-foreground px-4 py-2.5">
                       <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
+                      {msg.images && msg.images.length > 0 && (
+                        <div className="flex flex-wrap gap-2 mt-2">
+                          {msg.images.map((src, i) => (
+                            <img
+                              key={i}
+                              src={src}
+                              alt={`Attached ${i + 1}`}
+                              className="max-h-32 max-w-[200px] rounded-lg border border-white/20 object-cover cursor-pointer hover:opacity-80"
+                              onClick={() => window.open(src, "_blank")}
+                            />
+                          ))}
+                        </div>
+                      )}
                     </div>
                     <p className="text-[10px] text-muted-foreground mt-1 text-right">
                       {msg.timestamp.toLocaleTimeString()}
@@ -718,12 +807,30 @@ export function Dashboard({ selectedTaskId, onTaskStarted }: DashboardProps) {
               >
                 {uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Paperclip className="h-4 w-4" />}
               </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                className={`h-8 w-8 ${attachedImages.length > 0 ? "text-primary" : ""}`}
+                onClick={() => imageInputRef.current?.click()}
+                disabled={submitting}
+                title="Attach images (or paste with Ctrl+V)"
+              >
+                <ImagePlus className="h-4 w-4" />
+              </Button>
               <input
                 ref={fileInputRef}
                 type="file"
                 className="hidden"
                 accept=".txt,.md,.py,.js,.ts,.jsx,.tsx,.json,.csv,.yaml,.yml,.xml,.html,.css,.sql,.sh,.bat,.cfg,.ini,.toml,.env,.log"
                 onChange={handleFileUpload}
+              />
+              <input
+                ref={imageInputRef}
+                type="file"
+                className="hidden"
+                accept="image/*"
+                multiple
+                onChange={handleImageUpload}
               />
             </div>
 
@@ -747,18 +854,36 @@ export function Dashboard({ selectedTaskId, onTaskStarted }: DashboardProps) {
             )}
 
             <div className="flex-1 relative">
-              {uploadedFile && (
-                <div className="flex items-center gap-1 mb-1 ml-1">
-                  <span className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-primary/10 text-primary font-medium">
-                    <Paperclip className="h-3 w-3" />
-                    {uploadedFile.name}
-                    <button
-                      onClick={() => setUploadedFile(null)}
-                      className="ml-0.5 hover:text-red-500 transition-colors"
-                    >
-                      <X className="h-3 w-3" />
-                    </button>
-                  </span>
+              {/* Attached files & images preview */}
+              {(uploadedFile || attachedImages.length > 0) && (
+                <div className="flex flex-wrap items-center gap-2 mb-2 ml-1">
+                  {uploadedFile && (
+                    <span className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-primary/10 text-primary font-medium">
+                      <Paperclip className="h-3 w-3" />
+                      {uploadedFile.name}
+                      <button
+                        onClick={() => setUploadedFile(null)}
+                        className="ml-0.5 hover:text-red-500 transition-colors"
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
+                    </span>
+                  )}
+                  {attachedImages.map((img) => (
+                    <div key={img.id} className="relative group">
+                      <img
+                        src={img.dataUrl}
+                        alt="Attached"
+                        className="h-14 w-14 rounded-lg object-cover border border-border"
+                      />
+                      <button
+                        onClick={() => removeImage(img.id)}
+                        className="absolute -top-1.5 -right-1.5 h-4 w-4 rounded-full bg-red-500 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+                      >
+                        <X className="h-2.5 w-2.5" />
+                      </button>
+                    </div>
+                  ))}
                 </div>
               )}
               <Textarea
@@ -766,6 +891,7 @@ export function Dashboard({ selectedTaskId, onTaskStarted }: DashboardProps) {
                 value={inputValue}
                 onChange={(e) => setInputValue(e.target.value)}
                 onKeyDown={handleKeyDown}
+                onPaste={handlePaste}
                 placeholder={
                   activeTaskId
                     ? "Send a follow-up message..."

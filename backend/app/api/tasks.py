@@ -27,6 +27,12 @@ router = APIRouter()
 # ── Request/Response Schemas ────────────────────────────────────────────
 
 
+class ImageData(BaseModel):
+    """Schema for an attached image."""
+    data: str  # base64-encoded image data
+    media_type: str = "image/png"  # MIME type
+
+
 class TaskCreate(BaseModel):
     """Schema for creating a new task."""
     title: str
@@ -35,6 +41,7 @@ class TaskCreate(BaseModel):
     repo_name: Optional[str] = None
     repo_url: Optional[str] = None
     document_context: Optional[str] = None
+    image_data: Optional[List[ImageData]] = None
 
 
 # In-memory store for uploaded document context keyed by upload_id
@@ -199,6 +206,16 @@ async def create_task(
     # Collect document context (from upload or inline)
     document_context = task_data.document_context or ""
 
+    # Collect image data for vision analysis
+    image_data_list = []
+    if task_data.image_data:
+        for img in task_data.image_data:
+            image_data_list.append({
+                "data": img.data,
+                "media_type": img.media_type,
+            })
+        logger.info("Task #%d has %d attached image(s)", task.id, len(image_data_list))
+
     # Start the orchestrator in the background
     import asyncio
 
@@ -213,6 +230,7 @@ async def create_task(
             branch_name=branch_name,
             websocket_callback=ws_callback,
             document_context=document_context,
+            image_data=image_data_list if image_data_list else None,
         )
     )
 

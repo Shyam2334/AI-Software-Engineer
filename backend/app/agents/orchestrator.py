@@ -82,6 +82,9 @@ class WorkflowState(TypedDict, total=False):
     # Uploaded document context
     document_context: Optional[str]
 
+    # Attached images for vision analysis
+    image_data: Optional[List[Dict[str, str]]]
+
 
 # ── Helper: log + broadcast ────────────────────────────────────────────
 
@@ -305,6 +308,45 @@ async def analyze_node(state: WorkflowState) -> WorkflowState:
 
     task_desc = state.get("task_description", "")
     project_path = state.get("project_path", "")
+    image_data = state.get("image_data")
+
+    # Analyze attached images using Claude vision
+    image_analysis = ""
+    if image_data and len(image_data) > 0:
+        await _log(
+            state,
+            f"Analyzing {len(image_data)} attached image(s) for visual context...",
+            LogLevel.INFO,
+            "analyze",
+        )
+        try:
+            image_analysis = await ai_service.claude_vision_analyze(
+                images=image_data,
+                user_message=(
+                    f"The user has provided these image(s) along with the following task:\n\n"
+                    f"{task_desc}\n\n"
+                    "Analyze the image(s) thoroughly. If they show UI screenshots, identify:\n"
+                    "- Layout issues, alignment problems, spacing issues\n"
+                    "- Visual bugs, rendering issues, broken elements\n"
+                    "- Design improvements and accessibility concerns\n"
+                    "- Exact CSS/component changes needed to fix issues\n\n"
+                    "If they show error messages, diagrams, or mockups, describe what you see "
+                    "and how it relates to the task. Be specific and actionable."
+                ),
+            )
+            await _log(
+                state,
+                f"Image analysis complete ({len(image_analysis)} chars) — findings will guide the implementation",
+                LogLevel.SUCCESS,
+                "analyze",
+            )
+            # Append image analysis to the task description so subsequent nodes use it
+            state["task_description"] = (
+                f"{task_desc}\n\n"
+                f"## Image Analysis (from attached screenshots/images)\n{image_analysis}"
+            )
+        except Exception as e:
+            await _log(state, f"Image analysis error (non-fatal): {e}", LogLevel.WARNING, "analyze")
 
     # Get codebase summary if project exists
     codebase_summary = ""
@@ -315,8 +357,8 @@ async def analyze_node(state: WorkflowState) -> WorkflowState:
         file_count = codebase_summary.count("\n") if codebase_summary else 0
         await _log(state, f"Found {file_count} files in project", LogLevel.INFO, "analyze")
 
-    # Use Gemini for structured analysis
-    await _log(state, "Calling Gemini AI to classify task type, estimate complexity, and determine the best approach (this may take a few seconds)...", LogLevel.INFO, "analyze")
+    # Use AI for structured analysis
+    await _log(state, "Classifying task type, estimating complexity, and determining the best approach...", LogLevel.INFO, "analyze")
     analysis = await ai_service.gemini_structured_output(
         prompt=f"Analyze this software engineering task:\n\n{task_desc}\n\nCodebase:\n{codebase_summary[:2000]}",
         schema_description=TASK_ANALYZER_PROMPT,
@@ -348,8 +390,8 @@ async def plan_node(state: WorkflowState) -> WorkflowState:
         summary = git_service.get_repo_summary(project_path)
         codebase_summary = summary.get("tree", "")
 
-    # Use Gemini for planning
-    await _log(state, "Generating a detailed plan including file structure, dependencies, and test strategy — Gemini is thinking...", LogLevel.INFO, "plan")
+    # Use AI for planning
+    await _log(state, "Generating a detailed plan including file structure, dependencies, and test strategy...", LogLevel.INFO, "plan")
     plan = await ai_service.gemini_plan(task_desc, codebase_summary)
     state["implementation_plan"] = plan
 
@@ -382,7 +424,7 @@ async def code_node(state: WorkflowState) -> WorkflowState:
     if retry_count > 0:
         await _log(state, f"Regenerating code based on error analysis (revision {retry_count}) — fixing the issues found in the previous attempt...", LogLevel.INFO, "code", 40)
     else:
-        await _log(state, "Starting code generation — Claude will write production-quality source code and tests. This is the longest step and may take 30-90 seconds depending on complexity...", LogLevel.INFO, "code", 40)
+        await _log(state, "Starting code generation — writing production-quality source code and tests. This may take 30-90 seconds depending on complexity...", LogLevel.INFO, "code", 40)
 
     task_desc = state.get("task_description", "")
     plan = state.get("implementation_plan", "")
@@ -490,7 +532,7 @@ async def code_node(state: WorkflowState) -> WorkflowState:
 
     full_context = "\n\n".join(context_parts)
     context_size_kb = len(full_context) // 1024
-    await _log(state, f"Prompt assembled ({context_size_kb}KB) — sending to Claude for code generation. Larger prompts take longer...", LogLevel.INFO, "code", 46)
+    await _log(state, f"Prompt assembled ({context_size_kb}KB) — sending for code generation...", LogLevel.INFO, "code", 46)
 
     # Generate with Claude
     result = await ai_service.claude_code_generate(
@@ -500,7 +542,7 @@ async def code_node(state: WorkflowState) -> WorkflowState:
         language=state.get("code_language", "python"),
     )
 
-    await _log(state, "Claude responded — parsing generated code into individual files...", LogLevel.INFO, "code", 50)
+    await _log(state, "AI responded — parsing generated code into individual files...", LogLevel.INFO, "code", 50)
 
     # Parse generated files
     generated = _parse_code_blocks(result)
@@ -783,8 +825,8 @@ async def document_node(state: WorkflowState) -> WorkflowState:
             f"- {path}" for path in generated_code.keys()
         )
 
-        # Generate docs with Gemini
-        await _log(state, "Calling Gemini to generate documentation for the changed files...", LogLevel.INFO, "document", 82)
+        # Generate documentation
+        await _log(state, "Generating documentation for the changed files...", LogLevel.INFO, "document", 82)
         doc = await ai_service.gemini_document(
             code=code_summary,
             context=task_desc,
@@ -792,7 +834,7 @@ async def document_node(state: WorkflowState) -> WorkflowState:
         state["documentation"] = doc
 
         # Generate PR description
-        await _log(state, "Calling Claude to write a detailed pull request description...", LogLevel.INFO, "document", 84)
+        await _log(state, "Writing a detailed pull request description...", LogLevel.INFO, "document", 84)
         pr_desc = await ai_service.claude_generate(
             system_prompt=PR_DESCRIPTION_PROMPT,
             user_message=(
@@ -1221,6 +1263,7 @@ async def run_task(
     branch_name: str = "",
     websocket_callback: Optional[Any] = None,
     document_context: str = "",
+    image_data: Optional[List[Dict[str, str]]] = None,
 ) -> WorkflowState:
     """Execute the full orchestrator workflow for a task.
 
@@ -1231,6 +1274,7 @@ async def run_task(
         repo_name: GitHub repo name (owner/repo).
         branch_name: Git branch for changes.
         websocket_callback: Async callback for WebSocket updates.
+        image_data: List of image dicts with 'data' (base64) and 'media_type'.
 
     Returns:
         Final workflow state.
@@ -1244,6 +1288,7 @@ async def run_task(
         "retry_count": 0,
         "websocket_callback": websocket_callback,
         "document_context": document_context,
+        "image_data": image_data,
     }
 
     # Set up project directory if needed
